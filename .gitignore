@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# per-machine calibration results, not source code
+calibration/data/
