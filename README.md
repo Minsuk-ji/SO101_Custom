@@ -10,9 +10,25 @@ training, evaluation) is added incrementally, in its own folder.
 - [x] `motor_setup/` — motor ID mapping
 - [x] `calibration/` — homing offset + range of motion
 - [x] `teleoperate/` — leader -> follower real-time control loop
-- [ ] data recording
-- [ ] training
+- [x] `record/` — camera-inclusive episode recording (rerun viz, local or HF Hub storage)
+- [x] `training/` — pluggable multi-policy training (mlp_bc, ACT)
 - [ ] evaluation
+
+## Setup
+
+```bash
+conda create -n so101_custom python=3.12 -y
+conda activate so101_custom
+pip install -r requirements.txt
+```
+
+If you have an NVIDIA GPU, install a CUDA-enabled `torch` build first (see
+[pytorch.org](https://pytorch.org/get-started/locally/) — pip's default wheel may resolve to a
+CPU-only build depending on your platform), then run the `pip install -r requirements.txt` above;
+it will leave an already-satisfied `torch` alone.
+
+All commands below assume this environment is active (no `conda run` prefix needed once you've
+run `conda activate so101_custom`).
 
 ## `motor_setup/`
 
@@ -28,16 +44,14 @@ from lerobot's `motors_bus.py` / `feetech.py`, trimmed down to only what motor I
 
 ### Usage
 
-Requires the `scservo_sdk` package (installed in the `lerobot` conda env here):
-
 Run from the repo root (`so101_custom/`), so `motor_setup` resolves as a package:
 
 ```bash
 # Assign IDs one motor at a time (connect only the named motor when prompted)
-conda run -n lerobot python -m motor_setup.setup_motors --port /dev/ttyACM0
+python -m motor_setup.setup_motors --port /dev/ttyACM0
 
 # Verify: scan a fully assembled arm and list id -> joint name
-conda run -n lerobot python -m motor_setup.scan_bus --port /dev/ttyACM0
+python -m motor_setup.scan_bus --port /dev/ttyACM0
 ```
 
 ## `calibration/`
@@ -58,10 +72,10 @@ Builds on `motor_setup/feetech_bus.py` and `sts3215_table.py` rather than duplic
 
 ```bash
 # Run the interactive calibration (needs a display/keyboard nearby to move the arm by hand)
-conda run -n lerobot python -m calibration.calibrate --port /dev/ttyACM0 --name leader
+python -m calibration.calibrate --port /dev/ttyACM0 --name leader
 
 # Re-apply a previously saved calibration and print each joint's current position
-conda run -n lerobot python -m calibration.apply_calibration --port /dev/ttyACM0 --name leader
+python -m calibration.apply_calibration --port /dev/ttyACM0 --name leader
 ```
 
 ## `teleoperate/`
@@ -85,7 +99,73 @@ wrong angle. Converting through a common -100..100 scale makes "50% of the leade
 Requires both arms calibrated first (`calibration.calibrate`, once per arm):
 
 ```bash
-conda run -n lerobot python -m teleoperate.teleoperate \
+python -m teleoperate.teleoperate \
     --leader-port /dev/ttyACM1 --leader-name leader \
     --follower-port /dev/ttyACM0 --follower-name follower
+```
+
+## `record/`
+
+Teleoperates the follower while recording (observation, action) pairs plus camera video into
+episodes, and shows them live in [rerun](https://rerun.io/). Ported from lerobot's
+`lerobot_record.py` core loop; `LeRobotDataset`'s multi-episode chunking/streaming video encoding
+is dropped in favor of one plain folder per episode (simpler to read back, and unnecessary at
+personal-project scale). Storage is local-first; pushing to the HF Hub is a separate opt-in step
+using `huggingface_hub` directly — not the `lerobot` library.
+
+| File | What it does |
+|---|---|
+| `camera.py` | OpenCV camera wrapper — connect, read an RGB frame, disconnect |
+| `dataset_writer.py` | Writes one episode per folder: `frames.npz` (state/action arrays) + `videos/<camera>.mp4` (via `cv2.VideoWriter`), plus a dataset-level `info.json` |
+| `hub_upload.py` | Uploads a local dataset folder to a HF Hub dataset repo (`huggingface_hub.HfApi.upload_folder`) |
+| `record.py` | Main CLI — connects leader+follower (reusing `motor_setup`/`calibration`/`teleoperate`) and cameras, records `--num-episodes` episodes, logs every frame to rerun, and optionally pushes to the Hub at the end |
+
+Frame convention (matches lerobot): `observation.state` is the follower's position *before* the
+action is applied, `action` is the leader's position for that frame — so `(state_t, action_t) ->
+state_{t+1}` pairs are ready for imitation learning as-is.
+
+### Usage
+
+```bash
+python -m record.record \
+    --leader-port /dev/ttyACM1 --leader-name leader \
+    --follower-port /dev/ttyACM0 --follower-name follower \
+    --camera front=0 --camera wrist=2 \
+    --root ~/so101_data/pick_cube --task "pick up the red cube" \
+    --num-episodes 20 --episode-time 15 --reset-time 5 \
+    --push-to-hub --repo-id myuser/so101-pick-cube   # optional
+```
+
+## `training/`
+
+Trains a policy on a `record/`-produced dataset via imitation learning (behavior cloning). The
+key design goal here is **not being locked into one model**: `train.py` only depends on the
+`Policy` interface (`policy_base.py`) and a name -> class `registry.py`, so adding a new policy
+never requires touching the training script — drop a file in `policies/`, decorate the class with
+`@register_policy("name")`, and `--policy name` picks it up.
+
+| File | What it does |
+|---|---|
+| `policy_base.py` | Abstract `Policy` interface every policy implements: `forward(batch) -> (loss, logs)`, `select_action(batch) -> action`, `reset()` |
+| `registry.py` | `{name: class}` dict + `@register_policy` decorator + lookup — the pluggability mechanism |
+| `dataset.py` | `SO101Dataset` — reads `record/` output, decodes each episode's video once and caches it, yields `(state, action_chunk, images)` samples |
+| `checkpoint_io.py` | Save/load a checkpoint locally (`torch.save`), or push/pull it to a HF Hub model repo |
+| `policies/mlp_bc.py` | Baseline: small per-camera CNN + MLP, single-step (or short-chunk) action prediction — fast sanity check / comparison point |
+| `policies/act.py` | Trimmed [ACT](https://tonyzhaozh.github.io/aloha/) (Action Chunking Transformer): CNN backbone per camera -> transformer encoder (+ CVAE latent from the target action chunk during training) -> transformer decoder predicting a whole action chunk at once |
+| `train.py` | Policy-agnostic training loop: dataset -> `DataLoader` -> `policy.forward(batch)` -> backward -> checkpoint, identical regardless of `--policy` |
+
+### Usage
+
+```bash
+# ACT
+python -m training.train \
+    --policy act --dataset ~/so101_data/pick_cube \
+    --checkpoint-dir ~/so101_checkpoints/pick_cube_act \
+    --epochs 100 --batch-size 8
+
+# Simple baseline, same dataset, same command shape
+python -m training.train \
+    --policy mlp_bc --dataset ~/so101_data/pick_cube \
+    --checkpoint-dir ~/so101_checkpoints/pick_cube_mlp \
+    --push-to-hub --repo-id myuser/so101-pick-cube-mlp   # optional
 ```
